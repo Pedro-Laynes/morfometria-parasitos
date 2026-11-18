@@ -12,6 +12,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 from skimage.morphology import skeletonize, remove_small_objects
 from skimage.graph import route_through_array
 from scipy.ndimage import distance_transform_edt
+from scipy.interpolate import splprep, splev
 
 # ==============================================================================
 # CONFIGURACIÓN DE PÁGINA Y PARÁMETROS FÍSICOS
@@ -92,10 +93,38 @@ def rectificar_lamina(img_bgr, puntos_esquinas):
     return img_rect, img_regla
 
 
-def segmentar_parasito(img_rect_bgr, gamma_fondo, ganancia_gusano, umbral):
+def crear_corredor_roi(shape_hw, puntos_guia, radio_mm=1.25):
+    """
+    Crea una máscara tubular (corredor) alrededor de la trayectoria marcada por el usuario.
+    Aísla el parásito real y elimina bordes de cubreobjetos o reflejos lejanos.
+    """
+    h, w = shape_hw
+    roi = np.zeros((h, w), dtype=np.uint8)
+    if len(puntos_guia) < 2:
+        roi[:, :] = 255
+        return roi
+
+    pts = np.array(puntos_guia, dtype=np.int32)
+    grosor_px = max(10, int(round(2.0 * radio_mm * PX_PER_MM)))
+    cv2.polylines(roi, [pts], isClosed=False, color=255, thickness=grosor_px)
+    return roi
+
+
+def segmentar_parasito(img_rect_bgr, gamma_fondo, ganancia_gusano, umbral, puntos_guia=None, radio_corredor_mm=1.25):
+    """
+    Realza el contraste local del espécimen y restringe la detección al corredor
+    definido por los puntos guía (si ya existen >= 2 puntos).
+    """
     canal_L = cv2.cvtColor(img_rect_bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) / 255.0
-    L_ajustada = np.clip((canal_L ** gamma_fondo) * ganancia_gusano, 0.0, 1.0)
-    img_realzada = (L_ajustada * 255).astype(np.uint8)
+
+    # Realce local de estructuras filamentosas (Top-Hat) + curva Gamma/Gain
+    L_u8 = (canal_L * 255).astype(np.uint8)
+    kernel_tophat = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    tophat = cv2.morphologyEx(L_u8, cv2.MORPH_TOPHAT, kernel_tophat).astype(np.float32) / 255.0
+
+    # Combinar luminancia ajustada con el realce de estructuras finas (nematodos translúcidos)
+    L_combinada = np.clip((canal_L ** gamma_fondo) * ganancia_gusano + 0.45 * tophat, 0.0, 1.0)
+    img_realzada = (L_combinada * 255).astype(np.uint8)
 
     mascara = (img_realzada >= umbral).astype(bool)
     mascara[:MARGEN_BORDE_PX, :] = False
@@ -103,62 +132,106 @@ def segmentar_parasito(img_rect_bgr, gamma_fondo, ganancia_gusano, umbral):
     mascara[:, :MARGEN_BORDE_PX] = False
     mascara[:, -MARGEN_BORDE_PX:] = False
 
-    mascara = remove_small_objects(mascara, min_size=150)
+    # Si el usuario ya marcó puntos guía, restringir estrictamente al corredor del gusano
+    tiene_guia = puntos_guia is not None and len(puntos_guia) >= 2
+    if tiene_guia:
+        roi_tubo = crear_corredor_roi(mascara.shape, puntos_guia, radio_mm=radio_corredor_mm)
+        mascara = mascara & (roi_tubo > 0)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mascara = remove_small_objects(mascara, min_size=40 if tiene_guia else 150)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mascara_u8 = cv2.morphologyEx(mascara.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
     mascara_u8 = cv2.morphologyEx(mascara_u8, cv2.MORPH_OPEN, kernel)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mascara_u8)
     if num_labels > 1:
-        mayor = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-        mascara_final = (labels == mayor).astype(np.uint8) * 255
+        if tiene_guia:
+            # Conservar todos los segmentos del gusano que toquen o estén cerca de la trayectoria
+            mascara_final = mascara_u8
+        else:
+            mayor = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mascara_final = (labels == mayor).astype(np.uint8) * 255
     else:
         mascara_final = np.zeros_like(mascara_u8)
 
     return img_realzada, mascara_final
 
 
+def interpolar_spline_guia(puntos_guia, n_muestras=400):
+    """
+    Respaldo suave (spline cúbico o polilínea densa) en caso de que el nematodo sea
+    tan translúcido que el umbral deje huecos en la máscara.
+    """
+    pts = np.array(puntos_guia, dtype=np.float64)
+    # Eliminar puntos duplicados consecutivos
+    diffs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    pts = np.vstack([pts[0], pts[1:][diffs > 0.5]])
+
+    if len(pts) >= 4:
+        tck, _ = splprep([pts[:, 0], pts[:, 1]], s=2.0, k=min(3, len(pts) - 1))
+        u_fine = np.linspace(0, 1, n_muestras)
+        xs, ys = splev(u_fine, tck)
+        return np.column_stack((xs, ys))
+    else:
+        # Interpolación lineal densa para 2 o 3 puntos
+        segmentos = []
+        for i in range(len(pts) - 1):
+            t = np.linspace(0, 1, 100, endpoint=(i == len(pts) - 2))
+            seg = pts[i] + np.outer(t, pts[i + 1] - pts[i])
+            segmentos.append(seg)
+        return np.vstack(segmentos)
+
+
 def calcular_morfometria_y_figura(img_rect_bgr, mascara, puntos_guia, nombre_archivo, params_seg):
     img_rgb = cv2.cvtColor(img_rect_bgr, cv2.COLOR_BGR2RGB)
     mask_bin = (mascara > 0).astype(np.uint8)
+    h_img, w_img = mask_bin.shape
 
     esqueleto = skeletonize(mask_bin > 0)
     skel_ys, skel_xs = np.where(esqueleto)
     skel_coords = np.column_stack((skel_xs, skel_ys))
 
-    if len(skel_coords) == 0:
-        raise ValueError("No se detectó esqueleto. Ajusta el umbral de segmentación.")
-
-    # Mapa de costos: prioriza el esqueleto (costo 1), permite cruzar dentro de la
-    # máscara si hay cortes translúcidos (costo 25) y penaliza fuertemente salir del cuerpo (costo 500)
-    costo = np.full(mask_bin.shape, 500.0, dtype=np.float64)
-    costo[mask_bin > 0] = 25.0
-    costo[esqueleto] = 1.0
-
-    # Proyectar cada punto guía (waypoint) al píxel más cercano del esqueleto
-    nodos_rc = []
-    for pt in puntos_guia:
-        pt_arr = np.array(pt, dtype=np.float32)
-        idx_cercano = int(np.argmin(np.linalg.norm(skel_coords - pt_arr, axis=1)))
-        nodos_rc.append((int(skel_ys[idx_cercano]), int(skel_xs[idx_cercano])))
-
-    # Resolver la ruta geodésica tramo por tramo: P1 -> P2 -> P3 -> ... -> Pn
-    tramos_rc = []
-    for i in range(len(nodos_rc) - 1):
-        seg_rc, _ = route_through_array(costo, nodos_rc[i], nodos_rc[i + 1], fully_connected=True)
-        seg_arr = np.array(seg_rc)
-        if i > 0 and len(seg_arr) > 1:
-            seg_arr = seg_arr[1:]  # Evitar duplicar el nodo de unión entre tramos
-        tramos_rc.append(seg_arr)
-
-    ruta_rc = np.vstack(tramos_rc)
-    ruta_xy = ruta_rc[:, ::-1]
-
-    # Longitud Total (LT): suma de pasos del eje geodésico + micro-segmentos terminales exactos
     p_inicio_clic = np.array(puntos_guia[0], dtype=np.float32)
     p_fin_clic = np.array(puntos_guia[-1], dtype=np.float32)
 
+    # Si existe esqueleto dentro del corredor, trazamos la ruta geodésica guiada;
+    # si el nematodo es extremadamente translúcido y no hay máscara suficiente, usamos spline suave
+    if len(skel_coords) >= 10:
+        costo = np.full((h_img, w_img), 500.0, dtype=np.float64)
+        costo[mask_bin > 0] = 20.0
+        costo[esqueleto] = 1.0
+
+        nodos_rc = []
+        for pt in puntos_guia:
+            pt_arr = np.array(pt, dtype=np.float32)
+            dists = np.linalg.norm(skel_coords - pt_arr, axis=1)
+            idx_cercano = int(np.argmin(dists))
+            # Si el clic está cerca del esqueleto (< 15 px), enganchar al esqueleto; si no, al clic exacto
+            if dists[idx_cercano] < 15.0:
+                nodos_rc.append((int(skel_ys[idx_cercano]), int(skel_xs[idx_cercano])))
+            else:
+                nodos_rc.append((int(np.clip(round(pt[1]), 0, h_img - 1)),
+                                 int(np.clip(round(pt[0]), 0, w_img - 1))))
+
+        tramos_rc = []
+        for i in range(len(nodos_rc) - 1):
+            seg_rc, _ = route_through_array(costo, nodos_rc[i], nodos_rc[i + 1], fully_connected=True)
+            seg_arr = np.array(seg_rc)
+            if i > 0 and len(seg_arr) > 1:
+                seg_arr = seg_arr[1:]
+            tramos_rc.append(seg_arr)
+
+        ruta_rc = np.vstack(tramos_rc)
+        ruta_xy = ruta_rc[:, ::-1].astype(np.float64)
+    else:
+        ruta_xy = interpolar_spline_guia(puntos_guia)
+        ruta_rc = np.column_stack((
+            np.clip(np.round(ruta_xy[:, 1]).astype(int), 0, h_img - 1),
+            np.clip(np.round(ruta_xy[:, 0]).astype(int), 0, w_img - 1)
+        ))
+
+    # Longitud Total (LT)
     pasos_px = np.hypot(*np.diff(ruta_xy, axis=0).T) if len(ruta_xy) > 1 else np.array([0.0])
     lt_px = (
         np.sum(pasos_px)
@@ -168,25 +241,29 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, puntos_guia, nombre_arc
     lt_mm = float(lt_px / PX_PER_MM)
     lt_um = float(lt_mm * 1000.0)
 
-    # Ancho Corporal Máximo (ACM) evaluado a lo largo del eje central
-    mapa_radios = distance_transform_edt(mask_bin)
-    margen_ext = max(1, int(len(ruta_rc) * 0.05))
-    ruta_central_rc = ruta_rc[margen_ext:-margen_ext] if len(ruta_rc) > 20 else ruta_rc
+    # Ancho Corporal Máximo (ACM)
+    if np.sum(mask_bin) > 20:
+        mapa_radios = distance_transform_edt(mask_bin)
+        margen_ext = max(1, int(len(ruta_rc) * 0.05))
+        ruta_central_rc = ruta_rc[margen_ext:-margen_ext] if len(ruta_rc) > 20 else ruta_rc
 
-    radios = mapa_radios[ruta_central_rc[:, 0], ruta_central_rc[:, 1]]
-    idx_max = int(np.argmax(radios))
-    radio_max_px = float(radios[idx_max])
-    acm_mm = float((2.0 * radio_max_px) / PX_PER_MM)
-    acm_um = float(acm_mm * 1000.0)
-    ratio_lt_acm = float(lt_mm / acm_mm) if acm_mm > 0 else 0.0
+        radios = mapa_radios[ruta_central_rc[:, 0], ruta_central_rc[:, 1]]
+        idx_max = int(np.argmax(radios))
+        radio_max_px = float(radios[idx_max])
+        acm_mm = float((2.0 * radio_max_px) / PX_PER_MM)
+        acm_um = float(acm_mm * 1000.0)
+        ratio_lt_acm = float(lt_mm / acm_mm) if acm_mm > 0 else 0.0
 
-    centro_acm_xy = ruta_central_rc[idx_max][::-1]
-    idx_global = margen_ext + idx_max
-    tangente = ruta_xy[min(len(ruta_xy) - 1, idx_global + 3)] - ruta_xy[max(0, idx_global - 3)]
-    norma_t = np.linalg.norm(tangente)
-    normal = np.array([-tangente[1], tangente[0]]) / norma_t if norma_t > 0 else np.array([0.0, 1.0])
-    acm_p1 = centro_acm_xy + normal * radio_max_px
-    acm_p2 = centro_acm_xy - normal * radio_max_px
+        centro_acm_xy = ruta_central_rc[idx_max][::-1]
+        idx_global = margen_ext + idx_max
+        tangente = ruta_xy[min(len(ruta_xy) - 1, idx_global + 3)] - ruta_xy[max(0, idx_global - 3)]
+        norma_t = np.linalg.norm(tangente)
+        normal = np.array([-tangente[1], tangente[0]]) / norma_t if norma_t > 0 else np.array([0.0, 1.0])
+        acm_p1 = centro_acm_xy + normal * radio_max_px
+        acm_p2 = centro_acm_xy - normal * radio_max_px
+    else:
+        acm_mm, acm_um, ratio_lt_acm = 0.0, 0.0, 0.0
+        acm_p1, acm_p2 = None, None
 
     # Renderizar figura de validación en memoria (BytesIO)
     fig, ax = plt.subplots(figsize=(13, 5.5))
@@ -206,10 +283,11 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, puntos_guia, nombre_arc
                color="#00ff00", edgecolors="black", s=60, zorder=6, label="Extremos (Inicio / Fin)")
     if len(pts_arr) > 2:
         ax.scatter(pts_arr[1:-1, 0], pts_arr[1:-1, 1],
-                   color="#ff9900", edgecolors="black", s=45, zorder=5, label=f"Puntos guía intermedios ({len(pts_arr)-2})")
+                   color="#ff9900", edgecolors="black", s=45, zorder=5, label=f"Puntos guía ({len(pts_arr)-2})")
 
-    ax.plot([acm_p1[0], acm_p2[0]], [acm_p1[1], acm_p2[1]],
-            color="#ffdd00", linewidth=2.8, zorder=7, label="Ancho Corporal Máximo (ACM)")
+    if acm_p1 is not None and acm_mm > 0:
+        ax.plot([acm_p1[0], acm_p2[0]], [acm_p1[1], acm_p2[1]],
+                color="#ffdd00", linewidth=2.8, zorder=7, label="Ancho Corporal Máximo (ACM)")
 
     texto_res = (
         f"MUESTRA: {nombre_archivo}\n"
@@ -224,7 +302,10 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, puntos_guia, nombre_arc
     )
 
     ax.set_title(f"Validación Morfométrica — {nombre_archivo}", fontsize=12, fontweight="bold", pad=10)
-    ax.legend(loc="lower right", framealpha=0.88)
+    # Evitar etiquetas duplicadas en la leyenda
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), loc="lower right", framealpha=0.88)
     ax.axis("off")
 
     buf = io.BytesIO()
@@ -266,9 +347,9 @@ if "ultimo_clic_ext" not in st.session_state:
 if "calculo_confirmado" not in st.session_state:
     st.session_state.calculo_confirmado = False
 if "resultados_lote" not in st.session_state:
-    st.session_state.resultados_lote = {}      # {nombre_archivo: dict_metricas}
+    st.session_state.resultados_lote = {}
 if "imagenes_validadas" not in st.session_state:
-    st.session_state.imagenes_validadas = {}   # {nombre_archivo: bytes_png}
+    st.session_state.imagenes_validadas = {}
 
 
 def reiniciar_puntos_foto():
@@ -293,10 +374,11 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("2. Ajuste de Contraste")
-    gamma_val = st.slider("Oscurecer Fondo (Gamma)", 1.0, 6.0, 4.7, 0.1)
-    gain_val = st.slider("Iluminar Gusano (Gain)", 0.8, 2.5, 1.0, 0.05)
-    umbral_val = st.slider("Umbral Tejido (0–255)", 50, 245, 181, 1)
+    st.header("2. Ajuste de Contraste y Enfoque")
+    gamma_val = st.slider("Oscurecer Fondo (Gamma)", 1.0, 6.0, 2.5, 0.1)
+    gain_val = st.slider("Iluminar Gusano (Gain)", 0.8, 3.0, 1.4, 0.05)
+    umbral_val = st.slider("Umbral Tejido (0–255)", 30, 245, 130, 1)
+    radio_corredor = st.slider("Radio de búsqueda alrededor de puntos (mm)", 0.4, 3.0, 1.0, 0.1)
 
     st.divider()
     st.header("3. Exportación de Resultados")
@@ -335,7 +417,6 @@ if not archivos_subidos:
 if st.session_state.indice_actual >= len(archivos_subidos):
     st.session_state.indice_actual = 0
 
-# Barra de navegación entre fotos del lote
 nombres_fotos = [f.name for f in archivos_subidos]
 col_nav1, col_nav2, col_nav3 = st.columns([1, 3, 1])
 
@@ -405,20 +486,23 @@ if clic_esq is not None and clic_esq != st.session_state.ultimo_clic_esq:
         st.rerun()
 
 # ==============================================================================
-# PASO B: RECTIFICACIÓN + SEGMENTACIÓN + TRAZADO MULTI-PUNTO GUIADO
+# PASO B: RECTIFICACIÓN + SEGMENTACIÓN GUIADA + TRAZADO MULTI-PUNTO
 # ==============================================================================
 if len(st.session_state.esquinas_pts) == 4:
     st.divider()
     st.subheader("Paso 2: Marca la trayectoria desde la Cabeza hasta la Cola (2 o más puntos)")
     st.caption(
-        "Haz clic en orden desde un extremo hasta el otro siguiendo las curvas del parásito "
-        "(usa 2 puntos si es simple, o 5–10 puntos si está muy enrollado/curvado). Luego pulsa **Calcular Medición**."
+        "Al marcar tus puntos sobre el parásito, el programa enfoca la detección automáticamente "
+        "en ese corredor e ignora los bordes del cubreobjetos."
     )
 
+    pts_guia = st.session_state.extremos_pts
     img_rect, img_regla = rectificar_lamina(img_bgr, st.session_state.esquinas_pts)
-    img_realzada, mascara = segmentar_parasito(img_rect, gamma_val, gain_val, umbral_val)
+    img_realzada, mascara = segmentar_parasito(
+        img_rect, gamma_val, gain_val, umbral_val,
+        puntos_guia=pts_guia, radio_corredor_mm=radio_corredor
+    )
 
-    # Preparar overlay con regla + contorno cian + puntos guía numerados
     overlay = cv2.cvtColor(img_regla, cv2.COLOR_BGR2RGB)
     contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     verde = np.zeros_like(overlay)
@@ -426,7 +510,6 @@ if len(st.session_state.esquinas_pts) == 4:
     overlay = cv2.addWeighted(overlay, 0.80, verde, 0.20, 0)
     cv2.drawContours(overlay, contornos, -1, (0, 255, 255), 2)
 
-    pts_guia = st.session_state.extremos_pts
     if len(pts_guia) > 1:
         pts_line = np.array(pts_guia, dtype=np.int32)
         cv2.polylines(overlay, [pts_line], isClosed=False, color=(255, 165, 0), thickness=2)
@@ -462,7 +545,7 @@ if len(st.session_state.esquinas_pts) == 4:
                 st.session_state.calculo_confirmado = False
                 st.rerun()
 
-        st.image(img_realzada, caption="Vista de Contraste (Canal L*)", use_container_width=True)
+        st.image(img_realzada, caption="Vista de Contraste (Canal L* + Top-Hat)", use_container_width=True)
 
     with col_seg1:
         h_rect, w_rect = overlay.shape[:2]
@@ -472,7 +555,7 @@ if len(st.session_state.esquinas_pts) == 4:
 
         clic_ext = streamlit_image_coordinates(
             pil_rect,
-            key=f"ext_{archivo_activo.name}_{len(pts_guia)}_{gamma_val}_{gain_val}_{umbral_val}"
+            key=f"ext_{archivo_activo.name}_{len(pts_guia)}_{gamma_val}_{gain_val}_{umbral_val}_{radio_corredor}"
         )
 
         if clic_ext is not None and clic_ext != st.session_state.ultimo_clic_ext:
