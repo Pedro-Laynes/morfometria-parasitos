@@ -119,7 +119,7 @@ def segmentar_parasito(img_rect_bgr, gamma_fondo, ganancia_gusano, umbral):
     return img_realzada, mascara_final
 
 
-def calcular_morfometria_y_figura(img_rect_bgr, mascara, extremos, nombre_archivo, params_seg):
+def calcular_morfometria_y_figura(img_rect_bgr, mascara, puntos_guia, nombre_archivo, params_seg):
     img_rgb = cv2.cvtColor(img_rect_bgr, cv2.COLOR_BGR2RGB)
     mask_bin = (mascara > 0).astype(np.uint8)
 
@@ -130,30 +130,45 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, extremos, nombre_archiv
     if len(skel_coords) == 0:
         raise ValueError("No se detectó esqueleto. Ajusta el umbral de segmentación.")
 
-    p1_clic = np.array(extremos[0], dtype=np.float32)
-    p2_clic = np.array(extremos[1], dtype=np.float32)
-
-    idx_ini = np.argmin(np.linalg.norm(skel_coords - p1_clic, axis=1))
-    idx_fin = np.argmin(np.linalg.norm(skel_coords - p2_clic, axis=1))
-
-    nodo_ini = (skel_ys[idx_ini], skel_xs[idx_ini])
-    nodo_fin = (skel_ys[idx_fin], skel_xs[idx_fin])
-
-    costo = np.full(mask_bin.shape, np.inf, dtype=np.float64)
-    costo[mask_bin > 0] = 50.0
+    # Mapa de costos: prioriza el esqueleto (costo 1), permite cruzar dentro de la
+    # máscara si hay cortes translúcidos (costo 25) y penaliza fuertemente salir del cuerpo (costo 500)
+    costo = np.full(mask_bin.shape, 500.0, dtype=np.float64)
+    costo[mask_bin > 0] = 25.0
     costo[esqueleto] = 1.0
 
-    ruta_rc, _ = route_through_array(costo, nodo_ini, nodo_fin, fully_connected=True)
-    ruta_rc = np.array(ruta_rc)
+    # Proyectar cada punto guía (waypoint) al píxel más cercano del esqueleto
+    nodos_rc = []
+    for pt in puntos_guia:
+        pt_arr = np.array(pt, dtype=np.float32)
+        idx_cercano = int(np.argmin(np.linalg.norm(skel_coords - pt_arr, axis=1)))
+        nodos_rc.append((int(skel_ys[idx_cercano]), int(skel_xs[idx_cercano])))
+
+    # Resolver la ruta geodésica tramo por tramo: P1 -> P2 -> P3 -> ... -> Pn
+    tramos_rc = []
+    for i in range(len(nodos_rc) - 1):
+        seg_rc, _ = route_through_array(costo, nodos_rc[i], nodos_rc[i + 1], fully_connected=True)
+        seg_arr = np.array(seg_rc)
+        if i > 0 and len(seg_arr) > 1:
+            seg_arr = seg_arr[1:]  # Evitar duplicar el nodo de unión entre tramos
+        tramos_rc.append(seg_arr)
+
+    ruta_rc = np.vstack(tramos_rc)
     ruta_xy = ruta_rc[:, ::-1]
 
-    # Longitud Total (LT)
-    pasos_px = np.hypot(*np.diff(ruta_xy, axis=0).T)
-    lt_px = np.sum(pasos_px) + np.linalg.norm(p1_clic - ruta_xy[0]) + np.linalg.norm(p2_clic - ruta_xy[-1])
+    # Longitud Total (LT): suma de pasos del eje geodésico + micro-segmentos terminales exactos
+    p_inicio_clic = np.array(puntos_guia[0], dtype=np.float32)
+    p_fin_clic = np.array(puntos_guia[-1], dtype=np.float32)
+
+    pasos_px = np.hypot(*np.diff(ruta_xy, axis=0).T) if len(ruta_xy) > 1 else np.array([0.0])
+    lt_px = (
+        np.sum(pasos_px)
+        + np.linalg.norm(p_inicio_clic - ruta_xy[0])
+        + np.linalg.norm(p_fin_clic - ruta_xy[-1])
+    )
     lt_mm = float(lt_px / PX_PER_MM)
     lt_um = float(lt_mm * 1000.0)
 
-    # Ancho Corporal Máximo (ACM)
+    # Ancho Corporal Máximo (ACM) evaluado a lo largo del eje central
     mapa_radios = distance_transform_edt(mask_bin)
     margen_ext = max(1, int(len(ruta_rc) * 0.05))
     ruta_central_rc = ruta_rc[margen_ext:-margen_ext] if len(ruta_rc) > 20 else ruta_rc
@@ -163,7 +178,7 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, extremos, nombre_archiv
     radio_max_px = float(radios[idx_max])
     acm_mm = float((2.0 * radio_max_px) / PX_PER_MM)
     acm_um = float(acm_mm * 1000.0)
-    ratio_lt_acm = float(lt_mm / acm_mm)
+    ratio_lt_acm = float(lt_mm / acm_mm) if acm_mm > 0 else 0.0
 
     centro_acm_xy = ruta_central_rc[idx_max][::-1]
     idx_global = margen_ext + idx_max
@@ -183,18 +198,24 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, extremos, nombre_archiv
         if cnt.ndim == 2:
             ax.plot(cnt[:, 0], cnt[:, 1], color="#00ffff", linewidth=1.2, alpha=0.85, label="Contorno segmentado")
 
-    ruta_completa = np.vstack([p1_clic, ruta_xy, p2_clic])
-    ax.plot(ruta_completa[:, 0], ruta_completa[:, 1], color="#ff2a2a", linewidth=2.2, label="Eje Longitudinal (LT)")
-    ax.scatter([p1_clic[0], p2_clic[0]], [p1_clic[1], p2_clic[1]],
-               color="#00ff00", edgecolors="black", s=55, zorder=5, label="Extremos (Inicio / Fin)")
+    ruta_completa = np.vstack([p_inicio_clic, ruta_xy, p_fin_clic])
+    ax.plot(ruta_completa[:, 0], ruta_completa[:, 1], color="#ff2a2a", linewidth=2.2, label="Eje Longitudinal Guiado (LT)")
+
+    pts_arr = np.array(puntos_guia)
+    ax.scatter([pts_arr[0, 0], pts_arr[-1, 0]], [pts_arr[0, 1], pts_arr[-1, 1]],
+               color="#00ff00", edgecolors="black", s=60, zorder=6, label="Extremos (Inicio / Fin)")
+    if len(pts_arr) > 2:
+        ax.scatter(pts_arr[1:-1, 0], pts_arr[1:-1, 1],
+                   color="#ff9900", edgecolors="black", s=45, zorder=5, label=f"Puntos guía intermedios ({len(pts_arr)-2})")
+
     ax.plot([acm_p1[0], acm_p2[0]], [acm_p1[1], acm_p2[1]],
-            color="#ffdd00", linewidth=2.8, zorder=6, label="Ancho Corporal Máximo (ACM)")
+            color="#ffdd00", linewidth=2.8, zorder=7, label="Ancho Corporal Máximo (ACM)")
 
     texto_res = (
         f"MUESTRA: {nombre_archivo}\n"
         f"LONGITUD TOTAL (LT): {lt_mm:.3f} mm ({lt_um:.0f} µm)\n"
         f"ANCHO MÁXIMO (ACM):  {acm_mm:.3f} mm ({acm_um:.0f} µm)\n"
-        f"Relación LT/ACM:     {ratio_lt_acm:.2f} | Escala: {PX_PER_MM:.1f} px/mm"
+        f"Relación LT/ACM:     {ratio_lt_acm:.2f} | Puntos guía: {len(puntos_guia)}"
     )
     ax.text(
         0.015, 0.96, texto_res, transform=ax.transAxes, verticalalignment="top",
@@ -220,6 +241,7 @@ def calcular_morfometria_y_figura(img_rect_bgr, mascara, extremos, nombre_archiv
         "ACM_mm": round(acm_mm, 3),
         "ACM_um": round(acm_um, 1),
         "Relacion_LT_ACM": round(ratio_lt_acm, 2),
+        "Puntos_Guia": len(puntos_guia),
         "Escala_px_mm": PX_PER_MM,
         "Gamma": params_seg[0],
         "Gain": params_seg[1],
@@ -241,6 +263,8 @@ if "extremos_pts" not in st.session_state:
     st.session_state.extremos_pts = []
 if "ultimo_clic_ext" not in st.session_state:
     st.session_state.ultimo_clic_ext = None
+if "calculo_confirmado" not in st.session_state:
+    st.session_state.calculo_confirmado = False
 if "resultados_lote" not in st.session_state:
     st.session_state.resultados_lote = {}      # {nombre_archivo: dict_metricas}
 if "imagenes_validadas" not in st.session_state:
@@ -252,6 +276,7 @@ def reiniciar_puntos_foto():
     st.session_state.ultimo_clic_esq = None
     st.session_state.extremos_pts = []
     st.session_state.ultimo_clic_ext = None
+    st.session_state.calculo_confirmado = False
 
 
 # ==============================================================================
@@ -286,7 +311,6 @@ with st.sidebar:
             use_container_width=True
         )
 
-        # Generar ZIP con todas las imágenes validadas
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname, img_bytes in st.session_state.imagenes_validadas.items():
@@ -308,7 +332,6 @@ if not archivos_subidos:
     st.info("👈 Sube una o varias fotografías en el panel izquierdo para comenzar.")
     st.stop()
 
-# Asegurar que el índice esté dentro del rango actual
 if st.session_state.indice_actual >= len(archivos_subidos):
     st.session_state.indice_actual = 0
 
@@ -358,14 +381,13 @@ with c2:
         st.rerun()
     st.metric("Esquinas marcadas", f"{len(st.session_state.esquinas_pts)} / 4")
 
-# Dibujar puntos ya marcados sobre una vista previa escalada
 escala_visor = ANCHO_VISOR_PX / float(w_orig)
 h_visor = int(round(h_orig * escala_visor))
 preview_esq = img_rgb.copy()
 
 if st.session_state.esquinas_pts:
     pts_np = np.array(st.session_state.esquinas_pts, dtype=np.int32)
-    for idx_p, (px, py) in enumerate(pts_np):
+    for px, py in pts_np:
         cv2.circle(preview_esq, (px, py), max(6, int(w_orig * 0.008)), (255, 0, 0), -1)
     if len(pts_np) == 4:
         ord_pts = ordenar_esquinas(pts_np).astype(np.int32)
@@ -383,16 +405,20 @@ if clic_esq is not None and clic_esq != st.session_state.ultimo_clic_esq:
         st.rerun()
 
 # ==============================================================================
-# PASO B: RECTIFICACIÓN + SEGMENTACIÓN + 2 CLICS DE EXTREMOS
+# PASO B: RECTIFICACIÓN + SEGMENTACIÓN + TRAZADO MULTI-PUNTO GUIADO
 # ==============================================================================
 if len(st.session_state.esquinas_pts) == 4:
     st.divider()
-    st.subheader("Paso 2: Verifica la segmentación y haz 2 clics (Cabeza y Cola)")
+    st.subheader("Paso 2: Marca la trayectoria desde la Cabeza hasta la Cola (2 o más puntos)")
+    st.caption(
+        "Haz clic en orden desde un extremo hasta el otro siguiendo las curvas del parásito "
+        "(usa 2 puntos si es simple, o 5–10 puntos si está muy enrollado/curvado). Luego pulsa **Calcular Medición**."
+    )
 
     img_rect, img_regla = rectificar_lamina(img_bgr, st.session_state.esquinas_pts)
     img_realzada, mascara = segmentar_parasito(img_rect, gamma_val, gain_val, umbral_val)
 
-    # Preparar overlay con regla + contorno cian + extremos marcados
+    # Preparar overlay con regla + contorno cian + puntos guía numerados
     overlay = cv2.cvtColor(img_regla, cv2.COLOR_BGR2RGB)
     contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     verde = np.zeros_like(overlay)
@@ -400,17 +426,42 @@ if len(st.session_state.esquinas_pts) == 4:
     overlay = cv2.addWeighted(overlay, 0.80, verde, 0.20, 0)
     cv2.drawContours(overlay, contornos, -1, (0, 255, 255), 2)
 
-    for (ex, ey) in st.session_state.extremos_pts:
-        cv2.circle(overlay, (int(round(ex)), int(round(ey))), 7, (0, 255, 0), -1)
-        cv2.circle(overlay, (int(round(ex)), int(round(ey))), 8, (0, 0, 0), 2)
+    pts_guia = st.session_state.extremos_pts
+    if len(pts_guia) > 1:
+        pts_line = np.array(pts_guia, dtype=np.int32)
+        cv2.polylines(overlay, [pts_line], isClosed=False, color=(255, 165, 0), thickness=2)
+
+    for idx_g, (ex, ey) in enumerate(pts_guia):
+        cx, cy = int(round(ex)), int(round(ey))
+        color_pt = (0, 255, 0) if (idx_g == 0 or idx_g == len(pts_guia) - 1) else (255, 165, 0)
+        cv2.circle(overlay, (cx, cy), 6, color_pt, -1)
+        cv2.circle(overlay, (cx, cy), 7, (0, 0, 0), 2)
+        cv2.putText(overlay, str(idx_g + 1), (cx + 8, cy - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
 
     col_seg1, col_seg2 = st.columns([3, 1])
     with col_seg2:
-        if st.button("🔄 Reiniciar Extremos"):
-            st.session_state.extremos_pts = []
-            st.session_state.ultimo_clic_ext = None
-            st.rerun()
-        st.metric("Extremos marcados", f"{len(st.session_state.extremos_pts)} / 2")
+        st.metric("Puntos guía marcados", f"{len(pts_guia)} (mín. 2)")
+
+        if len(pts_guia) >= 2:
+            if st.button("📏 Calcular Medición", type="primary", use_container_width=True):
+                st.session_state.calculo_confirmado = True
+                st.rerun()
+
+        b_undo, b_reset = st.columns(2)
+        with b_undo:
+            if st.button("↩️ Deshacer", disabled=(len(pts_guia) == 0), use_container_width=True):
+                st.session_state.extremos_pts.pop()
+                st.session_state.ultimo_clic_ext = None
+                st.session_state.calculo_confirmado = False
+                st.rerun()
+        with b_reset:
+            if st.button("🔄 Limpiar", disabled=(len(pts_guia) == 0), use_container_width=True):
+                st.session_state.extremos_pts = []
+                st.session_state.ultimo_clic_ext = None
+                st.session_state.calculo_confirmado = False
+                st.rerun()
+
         st.image(img_realzada, caption="Vista de Contraste (Canal L*)", use_container_width=True)
 
     with col_seg1:
@@ -421,26 +472,26 @@ if len(st.session_state.esquinas_pts) == 4:
 
         clic_ext = streamlit_image_coordinates(
             pil_rect,
-            key=f"ext_{archivo_activo.name}_{len(st.session_state.extremos_pts)}_{gamma_val}_{gain_val}_{umbral_val}"
+            key=f"ext_{archivo_activo.name}_{len(pts_guia)}_{gamma_val}_{gain_val}_{umbral_val}"
         )
 
         if clic_ext is not None and clic_ext != st.session_state.ultimo_clic_ext:
             st.session_state.ultimo_clic_ext = clic_ext
-            if len(st.session_state.extremos_pts) < 2:
-                ex_real = clic_ext["x"] / escala_rect
-                ey_real = clic_ext["y"] / escala_rect
-                st.session_state.extremos_pts.append((ex_real, ey_real))
-                st.rerun()
+            ex_real = clic_ext["x"] / escala_rect
+            ey_real = clic_ext["y"] / escala_rect
+            st.session_state.extremos_pts.append((ex_real, ey_real))
+            st.session_state.calculo_confirmado = False
+            st.rerun()
 
     # ==========================================================================
     # PASO C: CÁLCULO AUTOMÁTICO Y GUARDADO EN EL LOTE
     # ==========================================================================
-    if len(st.session_state.extremos_pts) == 2:
+    if len(pts_guia) >= 2 and st.session_state.calculo_confirmado:
         st.divider()
         st.subheader("Paso 3: Resultado Morfométrico Validado")
         try:
             registro, png_bytes = calcular_morfometria_y_figura(
-                img_rect, mascara, st.session_state.extremos_pts,
+                img_rect, mascara, pts_guia,
                 archivo_activo.name, (gamma_val, gain_val, umbral_val)
             )
             st.session_state.resultados_lote[archivo_activo.name] = registro
