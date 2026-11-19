@@ -17,7 +17,7 @@ from scipy.signal import find_peaks
 from scipy.interpolate import splprep, splev
 
 # ==============================================================================
-# CONFIGURACIÓN DE PÁGINA Y ESTILOS VISUALES
+# CONFIGURACIÓN DE PÁGINA Y ESTILOS
 # ==============================================================================
 st.set_page_config(
     page_title="Morfometría Taxonómica de Nematodos",
@@ -37,7 +37,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# BIBLIOTECA DE REFERENCIAS Y CATÁLOGO DE ESTRUCTURAS
+# CATÁLOGOS TAXONÓMICOS, VIDRIERÍA Y PERFILES ANATÓMICOS
 # ==============================================================================
 MODOS_CALIBRACION = [
     "Microscopio / ToupView (Barra de escala de 2 puntos en µm)",
@@ -59,7 +59,7 @@ DIMS_VIDRIERIA = {
     "Laminilla rectangular (24.0 × 50.0 mm - 4 esquinas)": (50.0, 24.0, 25.0),
 }
 
-# (Código, Etiqueta descriptiva, Color Hex, Tipo: 'cuerpo_auto' | 'eje' | 'ancho_directo')
+# (Código, Descripción, Color Hex, Tipo: 'cuerpo_auto' | 'eje' | 'ancho_directo')
 CATALOGO_ESTRUCTURAS = {
     "LT":   ("Longitud Total [LT] (y ACM automático en foto macro)", "#ff2a2a", "cuerpo_auto"),
     "ACM":  ("Ancho Corporal Máximo [ACM] (2 clics pared a pared)", "#ffdd00", "ancho_directo"),
@@ -72,17 +72,26 @@ CATALOGO_ESTRUCTURAS = {
     "AAV":  ("Ancho del Apéndice Ventricular [AAV] (2 clics)", "#69f0ae", "ancho_directo"),
     "LCI":  ("Longitud del Ciego Intestinal [LCI]", "#ffea00", "eje"),
     "ACI":  ("Ancho del Ciego Intestinal [ACI] (2 clics)", "#fff59d", "ancho_directo"),
-    "LC":   ("Longitud de la Cola [LC] (ano/cloaca a punta)", "#2979ff", "eje"),
+    "LC":   ("Longitud de la Cola [LC] (ano/cloaca a extremo posterior)", "#2979ff", "eje"),
     "ACA":  ("Ancho Corporal a nivel del Ano/Cloaca [ACA] (2 clics)", "#82b1ff", "ancho_directo"),
     "DV":   ("Distancia Cabeza a Vulva [DV] (Adulto - Hembra)", "#ff4081", "eje"),
     "LESP": ("Longitud de Espículas [LESP] (Adulto - Macho)", "#76ff03", "eje"),
+}
+
+# Perfiles anatómicos típicos según género (estructuras presentes por defecto)
+PERFILES_GENERO = {
+    "Personalizado (Todas habilitadas)": list(CATALOGO_ESTRUCTURAS.keys()),
+    "Anisakis sp. (Sin ciego ni apéndice)": ["LT", "ACM", "AN", "LE", "AE", "LV", "AV", "LC", "ACA", "DV", "LESP"],
+    "Contracaecum sp. (Con ciego y apéndice)": ["LT", "ACM", "AN", "LE", "AE", "LV", "AV", "LAV", "AAV", "LCI", "ACI", "LC", "ACA", "DV", "LESP"],
+    "Pseudoterranova sp. (Con ciego, sin apéndice)": ["LT", "ACM", "AN", "LE", "AE", "LV", "AV", "LCI", "ACI", "LC", "ACA", "DV", "LESP"],
+    "Hysterothylacium sp. (Con ciego y apéndice)": ["LT", "ACM", "AN", "LE", "AE", "LV", "AV", "LAV", "AAV", "LCI", "ACI", "LC", "ACA", "DV", "LESP"],
 }
 
 ANCHO_VISOR_PX = 950
 
 
 # ==============================================================================
-# CALIBRACIÓN ÓPTICA, HOMOGRAFÍA Y BARRA DE ESCALA MICROSCÓPICA
+# FUNCIONES DE CALIBRACIÓN ÓPTICA Y HOMOGRAFÍA
 # ==============================================================================
 def corregir_distorsion_radial(img_bgr, k1):
     if abs(k1) < 1e-4:
@@ -157,10 +166,11 @@ def rectificar_lamina(img_bgr, puntos_esquinas, dim1_mm, dim2_mm, px_per_mm):
 
 
 # ==============================================================================
-# PROCESAMIENTO Y MEDICIÓN DE ESTRUCTURAS
+# SEGMENTACIÓN Y LIMPIEZA INTERACTIVA DE ARTEFACTOS
 # ==============================================================================
 def segmentar_cuerpo_macro(img_rect_bgr, gamma_fondo, ganancia_gusano, umbral, px_per_mm,
-                           puntos_guia=None, radio_corredor_mm=0.6, usar_sato=False):
+                           puntos_guia=None, radio_corredor_mm=0.6, usar_sato=False,
+                           puntos_borrar=None):
     canal_L = cv2.cvtColor(img_rect_bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) / 255.0
     L_u8 = (canal_L * 255).astype(np.uint8)
 
@@ -195,11 +205,29 @@ def segmentar_cuerpo_macro(img_rect_bgr, gamma_fondo, ganancia_gusano, umbral, p
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mascara_u8 = cv2.morphologyEx(mascara.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
     mascara_u8 = cv2.morphologyEx(mascara_u8, cv2.MORPH_OPEN, kernel)
+
+    # Eliminar formas / artefactos donde el usuario hizo clic en modo borrador
+    if puntos_borrar:
+        num_labels, labels = cv2.connectedComponents(mascara_u8)
+        h_m, w_m = mascara_u8.shape
+        radio_busq = max(4, int(round(0.25 * px_per_mm)))
+        for bx, by in puntos_borrar:
+            ix = int(np.clip(round(bx), 0, w_m - 1))
+            iy = int(np.clip(round(by), 0, h_m - 1))
+            # Buscar etiqueta en el punto exacto o vecindad inmediata
+            y1, y2 = max(0, iy - radio_busq), min(h_m, iy + radio_busq + 1)
+            x1, x2 = max(0, ix - radio_busq), min(w_m, ix + radio_busq + 1)
+            parche = labels[y1:y2, x1:x2]
+            etiquetas_tocadas = np.unique(parche[parche > 0])
+            for et in etiquetas_tocadas:
+                mascara_u8[labels == et] = 0
+                # También borrar un radio local por si estaba pegado al gusano
+                cv2.circle(mascara_u8, (ix, iy), max(6, int(round(0.35 * px_per_mm))), 0, -1)
+
     return img_realzada, mascara_u8
 
 
 def mejorar_contraste_microscopio(img_bgr, gamma_val, gain_val):
-    """Realza contraste local (CLAHE + Gamma) en fotos de campo claro de microscopio."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
@@ -231,16 +259,9 @@ def suavizar_curva_subpixel(ruta_xy, n_puntos=300):
 
 def medir_estructura(img_bgr, mascara_macro, puntos_guia, px_per_mm, tipo_estructura,
                      es_microscopio=False, suavizar_subpixel=True):
-    """
-    Calcula la medida en mm y µm según el tipo de estructura:
-    - 'ancho_directo': distancia euclidiana exacta entre los 2 puntos (o polilínea).
-    - 'eje': longitud de trayectoria guiada (con spline opcional en >=4 puntos).
-    - 'cuerpo_auto': longitud geodésica guiada + perfil continuo de grosor (Top-3 anchos).
-    """
     pts = np.array(puntos_guia, dtype=np.float64)
     p_inicio, p_fin = pts[0], pts[-1]
 
-    # 1. Ancho directo (pared a pared, ej. AE, AV, AAV, ACI, ACM en microscopio)
     if tipo_estructura == "ancho_directo":
         pasos = np.hypot(*np.diff(pts, axis=0).T) if len(pts) > 1 else np.array([0.0])
         dist_mm = float(np.sum(pasos) / px_per_mm)
@@ -254,7 +275,6 @@ def medir_estructura(img_bgr, mascara_macro, puntos_guia, px_per_mm, tipo_estruc
             "tipo": tipo_estructura,
         }
 
-    # 2. Eje interno en microscopía (LE, LV, LAV, LCI, AN, LC, DV, LESP)
     if es_microscopio or tipo_estructura == "eje" or mascara_macro is None:
         segmentos = []
         for i in range(len(pts) - 1):
@@ -275,7 +295,6 @@ def medir_estructura(img_bgr, mascara_macro, puntos_guia, px_per_mm, tipo_estruc
             "tipo": tipo_estructura,
         }
 
-    # 3. Cuerpo completo en foto macro (LT + ACM automático con Top-3 grosores)
     mask_bin = (mascara_macro > 0).astype(np.uint8)
     h_img, w_img = mask_bin.shape
     esqueleto = skeletonize(mask_bin > 0)
@@ -370,7 +389,7 @@ def calcular_indices_taxonomicos(medidas):
     def ratio(num_key, den_key, factor=1.0):
         num = medidas.get(num_key)
         den = medidas.get(den_key)
-        if num is not None and den is not None and den > 0:
+        if isinstance(num, (int, float)) and isinstance(den, (int, float)) and den > 0:
             return round((num / den) * factor, 2)
         return None
 
@@ -389,7 +408,9 @@ def calcular_indices_taxonomicos(medidas):
         "ACI/LCI": ratio("ACI", "LCI"),
     }
 
-    le, lv, lt = medidas.get("LE"), medidas.get("LV"), medidas.get("LT")
+    le = medidas.get("LE") if isinstance(medidas.get("LE"), (int, float)) else None
+    lv = medidas.get("LV") if isinstance(medidas.get("LV"), (int, float)) else None
+    lt = medidas.get("LT") if isinstance(medidas.get("LT"), (int, float)) else None
     le_gland = (le + lv) if (le is not None and lv is not None) else None
     b_prima = round(lt / le_gland, 2) if (lt and le_gland and le_gland > 0) else None
 
@@ -426,7 +447,7 @@ def generar_lamina_validacion(img_rgb, trazos_guardados, medidas_dict, indices_a
 
     lineas_texto = [
         f"ESPÉCIMEN: {meta_dict['ID_Especimen']} | FOTO: {titulo_ficha}",
-        f"TAXÓN: {meta_dict['Genero']} | {meta_dict['Estadio']} | Hosp: {meta_dict['Hospedador']}",
+        f"TAXÓN: {meta_dict['Genero']} ({meta_dict['Morfotipo']}) | {meta_dict['Estadio']} | Hosp: {meta_dict['Hospedador']}",
         f"Escala: {px_per_mm:.2f} px/mm ({px_per_mm/1000.0:.3f} px/µm)",
     ]
     resumen_idx = [f"{k}={v}" for k, v in indices_activos.items() if v is not None][:6]
@@ -439,7 +460,7 @@ def generar_lamina_validacion(img_rgb, trazos_guardados, medidas_dict, indices_a
         bbox=dict(boxstyle="round,pad=0.5", facecolor="#111111", edgecolor="#00ff88", alpha=0.88)
     )
 
-    ax.set_title(f"Validación Morfométrica — {titulo_ficha}", fontsize=11, fontweight="bold", pad=10)
+    ax.set_title(f"Ficha Morfométrica — {titulo_ficha}", fontsize=11, fontweight="bold", pad=10)
     ax.legend(loc="lower right", framealpha=0.88, fontsize=8.5)
     ax.axis("off")
 
@@ -452,113 +473,95 @@ def generar_lamina_validacion(img_rgb, trazos_guardados, medidas_dict, indices_a
 
 
 # ==============================================================================
-# ESTADO DE SESIÓN (CON FUSIÓN DE MEDIDAS POR ID DE ESPÉCIMEN)
+# ESTADO DE SESIÓN MULTI-IMAGEN POR ESPÉCIMEN
 # ==============================================================================
 defaults = {
-    "indice_actual": 0,
-    "calibracion_pts": [],
+    "foto_activa_idx": 0,
+    "estado_por_foto": {},       # {nombre_foto: {'cal_pts': [], 'modo_cal': str, 'escala_um': float|None, 'trazos': {}, 'borrar_pts': [], 'top3': []}}
     "ultimo_clic_cal": None,
-    "escala_micro_um": 200.0,
     "extremos_pts": [],
     "ultimo_clic_ext": None,
-    "contador_parasito_foto": 1,
-    "trazos_foto_actual": {},
-    "top3_acm_actual": [],
-    "base_especimenes": {},     # {ID_Especimen: dict_consolidado_con_todas_las_fotos}
-    "imagenes_validadas": {},   # {Nombre_Foto_P#: bytes_png}
+    "ultimo_clic_borrador": None,
+    "estructuras_ausentes": set(),
+    "base_especimenes": {},      # {ID_Especimen: dict_consolidado}
+    "imagenes_validadas": {},    # {ID_Especimen__Foto: bytes_png}
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-def reiniciar_todo_foto():
-    st.session_state.calibracion_pts = []
-    st.session_state.ultimo_clic_cal = None
-    st.session_state.extremos_pts = []
-    st.session_state.ultimo_clic_ext = None
-    st.session_state.contador_parasito_foto = 1
-    st.session_state.trazos_foto_actual = {}
-    st.session_state.top3_acm_actual = []
-
-
-def siguiente_parasito_misma_foto():
-    st.session_state.extremos_pts = []
-    st.session_state.ultimo_clic_ext = None
-    st.session_state.contador_parasito_foto += 1
-    st.session_state.trazos_foto_actual = {}
-    st.session_state.top3_acm_actual = []
+def obtener_estado_foto(nombre_foto):
+    if nombre_foto not in st.session_state.estado_por_foto:
+        st.session_state.estado_por_foto[nombre_foto] = {
+            "cal_pts": [],
+            "modo_cal": MODOS_CALIBRACION[0],
+            "escala_um": None,   # None hasta que el usuario ingrese el valor real de la barra
+            "trazos": {},
+            "borrar_pts": [],
+            "top3": [],
+        }
+    return st.session_state.estado_por_foto[nombre_foto]
 
 
 # ==============================================================================
-# BARRA LATERAL
+# BARRA LATERAL: CARGA, TAXONOMÍA, CARACTERES MORFOLÓGICOS Y EXPORTACIÓN
 # ==============================================================================
-st.title("🔬 Sistema Integrado de Morfometría Taxonómica de Nematodos")
+st.title("🔬 Estación Morfométrica y Taxonómica de Nematodos")
 
 with st.sidebar:
-    st.header("1. Carga de Fotos (Macro y Microscopio)")
+    st.header("1. Fotos del Espécimen / Lote")
     archivos_subidos = st.file_uploader(
-        "Sube fotos de portaobjetos y/o capturas ToupView",
+        "Sube todas las fotos del individuo (macro + 1–4 fotos ToupView)",
         type=["jpg", "jpeg", "png", "tif", "tiff"],
         accept_multiple_files=True
     )
 
     st.divider()
-    st.header("2. Identificación y Metadatos")
-    id_especimen = st.text_input(
-        "ID del Espécimen (Une fotos macro + micro del mismo gusano)",
-        value="LH_134_M"
-    )
-    meta_genero = st.text_input("Género / Especie", value="Anisakis sp.")
+    st.header("2. Identificación y Perfil Taxonómico")
+    id_especimen = st.text_input("ID del Espécimen (Ej. LH_134_M)", value="LH_134_M")
+    perfil_gen = st.selectbox("Perfil anatómico de referencia:", list(PERFILES_GENERO.keys()), index=0)
+    meta_genero = st.text_input("Género / Especie asignada", value="Anisakis sp." if "Anisakis" in perfil_gen else "Contracaecum sp.")
     meta_morfotipo = st.selectbox("Morfotipo", ["Tipo I", "Tipo II", "Tipo III", "Morfotipo A", "Morfotipo B", "No aplica"])
     meta_hospedador = st.text_input("Hospedador", value="No especificado")
     meta_estadio = st.selectbox("Estadio / Sexo", ["Larva (L3/L4)", "Adulto - Hembra", "Adulto - Macho"])
 
-    st.divider()
-    st.header("3. Modo de Calibración")
-    modo_cal = st.selectbox("Referencia presente en esta foto:", MODOS_CALIBRACION, index=0)
-    es_microscopio = "Microscopio" in modo_cal
-
-    if es_microscopio:
-        st.session_state.escala_micro_um = st.number_input(
-            "Valor de la barra de escala en la foto (µm):",
-            min_value=1.0, max_value=50000.0, value=200.0, step=10.0
-        )
-    elif modo_cal in DIMS_VIDRIERIA:
-        dim1_mm, dim2_mm, px_per_mm_vid = DIMS_VIDRIERIA[modo_cal]
-    else:
-        c_d1, c_d2 = st.columns(2)
-        dim1_mm = c_d1.number_input("Ancho (mm)", 1.0, 200.0, 22.0, 0.5)
-        dim2_mm = c_d2.number_input("Alto (mm)", 1.0, 200.0, 22.0, 0.5)
-        px_per_mm_vid = 40.0 if max(dim1_mm, dim2_mm) <= 30.0 else 20.0
+    with st.expander("🧬 Caracteres Morfológicos Cualitativos", expanded=True):
+        c_deiridios = st.selectbox("Deiridios", ["No evaluado", "Presentes (prominentes)", "Presentes (inconspicuos)", "Ausentes"])
+        c_labios = st.selectbox("Labios cefálicos", ["No evaluado", "Subdesarrollados (3 labios)", "Bien desarrollados (bilobulados)", "Con interlabios"])
+        c_cuticula = st.selectbox("Estriación cuticular", ["No evaluado", "Finamente estriada", "Fuertemente estriada", "Anillada / con espinas"])
+        c_mucron = st.selectbox("Presencia de mucrón caudal", ["No evaluado", "Presente", "Ausente"])
+        c_diente = st.selectbox("Diente larval (bore tooth)", ["No evaluado", "Presente", "Ausente"])
+        c_cola = st.selectbox("Forma de la cola", ["No evaluado", "Cónica en punta", "Roma / redondeada", "Ovalada", "Digitiforme / mucronada"])
+        c_obs = st.text_input("Observaciones morfológicas", value="")
 
     st.divider()
-    st.header("4. Contraste y Visión Avanzada")
+    st.header("3. Contraste y Visión Avanzada")
     gamma_val = st.slider("Contraste / Oscurecer Fondo (Gamma)", 1.0, 6.0, 2.2, 0.1)
     gain_val = st.slider("Brillo / Iluminar Tejido (Gain)", 0.8, 3.0, 1.15, 0.05)
-    umbral_val = st.slider("Umbral Segmentación Macro (0–255)", 20, 245, 130, 1, disabled=es_microscopio)
-    radio_corredor = st.slider("Radio búsqueda macro (mm)", 0.15, 2.5, 0.6, 0.05, disabled=es_microscopio)
+    umbral_val = st.slider("Umbral Segmentación Macro (0–255)", 20, 245, 130, 1)
+    radio_corredor = st.slider("Radio búsqueda macro (mm)", 0.15, 2.5, 0.6, 0.05)
 
     with st.expander("🛠️ Visión Avanzada (Sato, Spline y Lente)", expanded=False):
-        usar_sato = st.checkbox("Filtro Tubular de Sato (macro translúcido)", value=False, disabled=es_microscopio)
+        usar_sato = st.checkbox("Filtro Tubular de Sato (macro translúcido)", value=False)
         suavizar_eje = st.checkbox("Refinamiento Subpíxel de Curva (Spline)", value=True)
         k1_lente = st.slider("Corrección Distorsión Radial Lente (k1)", -0.30, 0.30, 0.0, 0.02)
 
     st.divider()
-    st.header("5. Exportación Consolidada")
+    st.header("4. Exportación Consolidada")
     if st.session_state.base_especimenes:
         df_export = pd.DataFrame(list(st.session_state.base_especimenes.values()))
         st.download_button(
             label=f"📊 Descargar CSV Consolidado ({len(df_export)} especímenes)",
             data=df_export.to_csv(index=False).encode("utf-8"),
-            file_name="morfometria_consolidada_tesis.csv",
+            file_name="morfometria_taxonomica_consolidada.csv",
             mime="text/csv",
             use_container_width=True
         )
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for id_m, img_bytes in st.session_state.imagenes_validadas.items():
-                limpio = id_m.replace(" ", "_").replace("#", "P")
+                limpio = id_m.replace(" ", "_").replace("#", "P").replace("/", "_")
                 zf.writestr(f"{limpio}_validado.png", img_bytes)
         zip_buf.seek(0)
         st.download_button(
@@ -570,38 +573,32 @@ with st.sidebar:
         )
 
 if not archivos_subidos:
-    st.info("👈 Sube tus fotografías (macro del portaobjetos o capturas de microscopio ToupView) en el panel izquierdo.")
+    st.info("👈 Sube tus fotografías (puedes subir simultáneamente la foto macro y hasta 4 fotos de microscopio ToupView del mismo parásito).")
     st.stop()
 
-if st.session_state.indice_actual >= len(archivos_subidos):
-    st.session_state.indice_actual = 0
+if st.session_state.foto_activa_idx >= len(archivos_subidos):
+    st.session_state.foto_activa_idx = 0
 
-# Navegación de fotos
-nombres_fotos = [f.name for f in archivos_subidos]
-c_n1, c_n2, c_n3 = st.columns([1, 3, 1])
-with c_n1:
-    if st.button("⬅️ Foto Anterior", disabled=(st.session_state.indice_actual == 0)):
-        st.session_state.indice_actual -= 1
-        reiniciar_todo_foto()
-        st.rerun()
-with c_n2:
-    sel = st.selectbox(
-        f"Fotografía activa ({st.session_state.indice_actual + 1} de {len(archivos_subidos)}):",
-        options=range(len(archivos_subidos)),
-        index=st.session_state.indice_actual,
-        format_func=lambda i: f"{'✅' if any(k.startswith(nombres_fotos[i]) for k in st.session_state.imagenes_validadas) else '⏳'} {nombres_fotos[i]}"
-    )
-    if sel != st.session_state.indice_actual:
-        st.session_state.indice_actual = sel
-        reiniciar_todo_foto()
-        st.rerun()
-with c_n3:
-    if st.button("Foto Siguiente ➡️", disabled=(st.session_state.indice_actual >= len(archivos_subidos) - 1)):
-        st.session_state.indice_actual += 1
-        reiniciar_todo_foto()
+# ==============================================================================
+# NAVEGACIÓN SIMULTÁNEA ENTRE LAS FOTOS SUBIDAS DEL ESPÉCIMEN
+# ==============================================================================
+st.subheader(f"📂 Imágenes cargadas para el Espécimen [{id_especimen}] ({len(archivos_subidos)} archivos)")
+cols_tabs = st.columns(min(6, len(archivos_subidos)))
+for idx_f, f_obj in enumerate(archivos_subidos):
+    est_f = obtener_estado_foto(f_obj.name)
+    n_med = len(est_f["trazos"])
+    cal_ok = "✅" if (len(est_f["cal_pts"]) in (2, 4)) else "📏"
+    etiqueta_btn = f"{cal_ok} Foto {idx_f+1}: {f_obj.name[:16]} ({n_med} med.)"
+    tipo_btn = "primary" if idx_f == st.session_state.foto_activa_idx else "secondary"
+    if cols_tabs[idx_f % len(cols_tabs)].button(etiqueta_btn, key=f"tab_f_{idx_f}", type=tipo_btn, use_container_width=True):
+        st.session_state.foto_activa_idx = idx_f
+        st.session_state.extremos_pts = []
+        st.session_state.ultimo_clic_ext = None
         st.rerun()
 
-archivo_activo = archivos_subidos[st.session_state.indice_actual]
+archivo_activo = archivos_subidos[st.session_state.foto_activa_idx]
+est_foto = obtener_estado_foto(archivo_activo.name)
+
 bytes_img = np.asarray(bytearray(archivo_activo.read()), dtype=np.uint8)
 archivo_activo.seek(0)
 img_bgr_raw = cv2.imdecode(bytes_img, cv2.IMREAD_COLOR)
@@ -610,27 +607,83 @@ img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 h_orig, w_orig = img_rgb.shape[:2]
 
 # ==============================================================================
-# PASO 1: CALIBRACIÓN (2 PUNTOS EN BARRA DE ESCALA O 4 ESQUINAS EN LÁMINA)
+# PASO 1: CALIBRACIÓN INDEPENDIENTE POR IMAGEN
 # ==============================================================================
-pts_requeridos = 2 if es_microscopio else 4
+st.divider()
+c_modo1, c_modo2 = st.columns([2.5, 1.5])
+with c_modo1:
+    modo_sel = st.selectbox(
+        f"📐 Referencia de calibración para [{archivo_activo.name}]:",
+        options=MODOS_CALIBRACION,
+        index=MODOS_CALIBRACION.index(est_foto["modo_cal"]),
+        key=f"sel_modo_{archivo_activo.name}"
+    )
+    if modo_sel != est_foto["modo_cal"]:
+        est_foto["modo_cal"] = modo_sel
+        est_foto["cal_pts"] = []
+        est_foto["escala_um"] = None
+        st.rerun()
+
+es_microscopio = "Microscopio" in est_foto["modo_cal"]
+pts_req = 2 if es_microscopio else 4
+
+with c_modo2:
+    if not es_microscopio:
+        if est_foto["modo_cal"] in DIMS_VIDRIERIA:
+            dim1_mm, dim2_mm, px_per_mm_vid = DIMS_VIDRIERIA[est_foto["modo_cal"]]
+        else:
+            d1, d2 = st.columns(2)
+            dim1_mm = d1.number_input("Ancho (mm)", 1.0, 200.0, 22.0, 0.5, key=f"d1_{archivo_activo.name}")
+            dim2_mm = d2.number_input("Alto (mm)", 1.0, 200.0, 22.0, 0.5, key=f"d2_{archivo_activo.name}")
+            px_per_mm_vid = 40.0 if max(dim1_mm, dim2_mm) <= 30.0 else 20.0
+
 if es_microscopio:
-    st.subheader(f"Paso 1: Haz clic en los 2 extremos de la barra de escala ({st.session_state.escala_micro_um:.0f} µm)")
+    st.subheader("Paso 1: Marca los 2 extremos de la barra de escala e indica su valor real (µm)")
 else:
     st.subheader(f"Paso 1: Haz clic en las 4 esquinas de la referencia ({dim1_mm} × {dim2_mm} mm)")
 
-c1, c2 = st.columns([3, 1])
+c1, c2 = st.columns([3, 1.1])
 with c2:
-    if st.button("🔄 Reiniciar Calibración"):
-        reiniciar_todo_foto()
+    if st.button("🔄 Reiniciar Calibración de esta Foto", use_container_width=True):
+        est_foto["cal_pts"] = []
+        est_foto["escala_um"] = None
+        st.session_state.ultimo_clic_cal = None
         st.rerun()
-    st.metric("Puntos de calibración", f"{len(st.session_state.calibracion_pts)} / {pts_requeridos}")
+    st.metric("Puntos de calibración", f"{len(est_foto['cal_pts'])} / {pts_req}")
+
+    # En modo microscopio, pedir el valor de la escala una vez observada la foto / marcados los 2 puntos
+    if es_microscopio:
+        st.markdown("**Valor leído en la barra (µm):**")
+        b_s1, b_s2, b_s3, b_s4 = st.columns(4)
+        if b_s1.button("50", use_container_width=True):
+            est_foto["escala_um"] = 50.0
+            st.rerun()
+        if b_s2.button("100", use_container_width=True):
+            est_foto["escala_um"] = 100.0
+            st.rerun()
+        if b_s3.button("200", use_container_width=True):
+            est_foto["escala_um"] = 200.0
+            st.rerun()
+        if b_s4.button("500", use_container_width=True):
+            est_foto["escala_um"] = 500.0
+            st.rerun()
+
+        val_ingresado = st.number_input(
+            "O escribe otro valor (µm):",
+            min_value=0.0, max_value=100000.0,
+            value=float(est_foto["escala_um"]) if est_foto["escala_um"] is not None else 0.0,
+            step=10.0,
+            key=f"num_um_{archivo_activo.name}"
+        )
+        if val_ingresado > 0:
+            est_foto["escala_um"] = val_ingresado
 
 escala_visor = ANCHO_VISOR_PX / float(w_orig)
 h_visor = int(round(h_orig * escala_visor))
 preview_cal = img_rgb.copy()
 
-if st.session_state.calibracion_pts:
-    pts_np = np.array(st.session_state.calibracion_pts, dtype=np.int32)
+if est_foto["cal_pts"]:
+    pts_np = np.array(est_foto["cal_pts"], dtype=np.int32)
     for px, py in pts_np:
         cv2.circle(preview_cal, (px, py), max(5, int(w_orig * 0.006)), (255, 0, 0), -1)
     if es_microscopio and len(pts_np) == 2:
@@ -639,63 +692,92 @@ if st.session_state.calibracion_pts:
         ord_pts = ordenar_esquinas(pts_np).astype(np.int32)
         cv2.polylines(preview_cal, [ord_pts], isClosed=True, color=(0, 255, 0), thickness=max(2, int(w_orig * 0.003)))
 
-pil_cal = Image.fromarray(preview_cal).resize((ANCHO_VISOR_PX, h_visor))
-clic_cal = streamlit_image_coordinates(pil_cal, key=f"cal_{archivo_activo.name}_{len(st.session_state.calibracion_pts)}_{k1_lente}")
+with c1:
+    pil_cal = Image.fromarray(preview_cal).resize((ANCHO_VISOR_PX, h_visor))
+    clic_cal = streamlit_image_coordinates(pil_cal, key=f"cal_{archivo_activo.name}_{len(est_foto['cal_pts'])}_{k1_lente}")
 
 if clic_cal is not None and clic_cal != st.session_state.ultimo_clic_cal:
     st.session_state.ultimo_clic_cal = clic_cal
-    if len(st.session_state.calibracion_pts) < pts_requeridos:
-        st.session_state.calibracion_pts.append((clic_cal["x"] / escala_visor, clic_cal["y"] / escala_visor))
+    if len(est_foto["cal_pts"]) < pts_req:
+        est_foto["cal_pts"].append((clic_cal["x"] / escala_visor, clic_cal["y"] / escala_visor))
         st.rerun()
 
+# Verificar si la calibración está completa para pasar al trazado
+calibracion_lista = False
+if es_microscopio:
+    if len(est_foto["cal_pts"]) == 2:
+        if est_foto["escala_um"] is not None and est_foto["escala_um"] > 0:
+            calibracion_lista = True
+        else:
+            st.warning("⚠️ Ya marcaste los 2 extremos de la barra. Ahora selecciona o escribe su valor en **µm** (ej. 50, 100, 200) en el panel derecho para activar la medición.")
+elif len(est_foto["cal_pts"]) == 4:
+    calibracion_lista = True
+
 # ==============================================================================
-# PASO 2: TRAZADO DE ESTRUCTURAS CON EDICIÓN Y DESHACER COMPLETO
+# PASO 2: MEDICIÓN DE ESTRUCTURAS + LIMPIEZA DE CONTRASTES FALSOS
 # ==============================================================================
-if len(st.session_state.calibracion_pts) == pts_requeridos:
+if calibracion_lista:
     st.divider()
-    etiqueta_foto = f"{archivo_activo.name} #P{st.session_state.contador_parasito_foto}"
 
     if es_microscopio:
-        p_a, p_b = np.array(st.session_state.calibracion_pts[0]), np.array(st.session_state.calibracion_pts[1])
+        p_a, p_b = np.array(est_foto["cal_pts"][0]), np.array(est_foto["cal_pts"][1])
         dist_barra_px = float(np.linalg.norm(p_b - p_a))
-        escala_mm = st.session_state.escala_micro_um / 1000.0
-        px_per_mm = dist_barra_px / escala_mm if escala_mm > 0 else 1000.0
+        escala_mm = est_foto["escala_um"] / 1000.0
+        px_per_mm = dist_barra_px / escala_mm
         img_trabajo_bgr = img_bgr.copy()
         img_trabajo_rgb = mejorar_contraste_microscopio(img_bgr, gamma_val, gain_val)
         mascara_macro = None
-        st.caption(f"✅ Barra calibrada: **{dist_barra_px:.1f} px = {st.session_state.escala_micro_um:.0f} µm** → Resolución: **{px_per_mm/1000.0:.3f} px/µm** ({px_per_mm:.1f} px/mm)")
+        st.success(f"📏 Escala activa en **{archivo_activo.name}**: **{dist_barra_px:.1f} px = {est_foto['escala_um']:.0f} µm** ({px_per_mm/1000.0:.3f} px/µm)")
     else:
         px_per_mm = px_per_mm_vid
         img_trabajo_bgr, img_regla = rectificar_lamina(
-            img_bgr, st.session_state.calibracion_pts, dim1_mm, dim2_mm, px_per_mm
+            img_bgr, est_foto["cal_pts"], dim1_mm, dim2_mm, px_per_mm
         )
         _, mascara_macro = segmentar_cuerpo_macro(
             img_trabajo_bgr, gamma_val, gain_val, umbral_val, px_per_mm,
-            puntos_guia=st.session_state.extremos_pts, radio_corredor_mm=radio_corredor, usar_sato=usar_sato
+            puntos_guia=st.session_state.extremos_pts,
+            radio_corredor_mm=radio_corredor,
+            usar_sato=usar_sato,
+            puntos_borrar=est_foto["borrar_pts"]
         )
         img_trabajo_rgb = cv2.cvtColor(img_regla, cv2.COLOR_BGR2RGB)
 
-    st.subheader(f"Paso 2: Trazado de Estructuras — Espécimen [{id_especimen}] ({etiqueta_foto})")
+    st.subheader(f"Paso 2: Trazado de Estructuras en [{archivo_activo.name}] → Espécimen [{id_especimen}]")
 
-    opciones_est = ["LT", "ACM", "AN", "LE", "AE", "LV", "AV", "LAV", "AAV", "LCI", "ACI", "LC", "ACA"]
-    if meta_estadio == "Adulto - Hembra":
-        opciones_est.append("DV")
-    elif meta_estadio == "Adulto - Macho":
-        opciones_est.append("LESP")
+    # Filtrar estructuras disponibles según perfil de género y sexo/estadio
+    estr_perfil = PERFILES_GENERO[perfil_gen]
+    opciones_est = [
+        c for c in CATALOGO_ESTRUCTURAS.keys()
+        if c in estr_perfil and c not in st.session_state.estructuras_ausentes
+    ]
+    if meta_estadio != "Adulto - Hembra" and "DV" in opciones_est:
+        opciones_est.remove("DV")
+    if meta_estadio != "Adulto - Macho" and "LESP" in opciones_est:
+        opciones_est.remove("LESP")
 
     col_sel_est, col_zoom, col_px, col_py = st.columns([2.4, 1.2, 1, 1])
     with col_sel_est:
         est_activa = st.selectbox(
-            "🧬 Estructura a medir:",
+            "🧬 Estructura anatómica a medir en esta imagen:",
             options=opciones_est,
-            format_func=lambda c: f"{'✅' if c in st.session_state.trazos_foto_actual else '📍'} [{c}] {CATALOGO_ESTRUCTURAS[c][0]}"
+            format_func=lambda c: f"{'✅' if c in est_foto['trazos'] else '📍'} [{c}] {CATALOGO_ESTRUCTURAS[c][0]}"
         )
     with col_zoom:
-        zoom_factor = st.slider("🔍 Zoom", 1.0, 4.0, 1.0, 0.25)
+        zoom_factor = st.slider("🔍 Zoom", 1.0, 4.0, 1.0, 0.25, key=f"z_{archivo_activo.name}")
     with col_px:
-        pan_x = st.slider("↔️ Pan X", 0, 100, 50, 1, disabled=(zoom_factor == 1.0))
+        pan_x = st.slider("↔️ Pan X", 0, 100, 50, 1, disabled=(zoom_factor == 1.0), key=f"px_{archivo_activo.name}")
     with col_py:
-        pan_y = st.slider("↕️ Pan Y", 0, 100, 50, 1, disabled=(zoom_factor == 1.0))
+        pan_y = st.slider("↕️ Pan Y", 0, 100, 50, 1, disabled=(zoom_factor == 1.0), key=f"py_{archivo_activo.name}")
+
+    # Modo de interacción con el mouse: Trazar estructura vs Eliminar contraste falso
+    modo_clic = "📍 Trazar puntos de estructura"
+    if not es_microscopio:
+        modo_clic = st.radio(
+            "Acción del clic sobre la imagen:",
+            ["📍 Trazar puntos de estructura", "🧹 Eliminar forma / contraste falso (clic sobre mancha)"],
+            horizontal=True,
+            key=f"rad_clic_{archivo_activo.name}"
+        )
 
     pts_guia = st.session_state.extremos_pts
     overlay = img_trabajo_rgb.copy()
@@ -707,13 +789,14 @@ if len(st.session_state.calibracion_pts) == pts_requeridos:
         overlay = cv2.addWeighted(overlay, 0.82, verde, 0.18, 0)
         cv2.drawContours(overlay, contornos, -1, (0, 255, 255), 2)
 
-    # Dibujar estructuras ya confirmadas en esta foto
-    for cod_g, trazo_g in st.session_state.trazos_foto_actual.items():
+    # Dibujar estructuras ya fijadas en esta imagen
+    for cod_g, trazo_g in est_foto["trazos"].items():
+        _, color_hex, _ = CATALOGO_ESTRUCTURAS[cod_g]
         r_xy = trazo_g["ruta_xy"].astype(np.int32)
         cv2.polylines(overlay, [r_xy], isClosed=False, color=(255, 60, 60), thickness=2)
         cv2.putText(overlay, cod_g, tuple(r_xy[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
 
-    # Dibujar puntos guía activos en edición
+    # Dibujar puntos guía activos
     if len(pts_guia) > 1:
         cv2.polylines(overlay, [np.array(pts_guia, dtype=np.int32)], isClosed=False, color=(255, 165, 0), thickness=2)
     for idx_g, (ex, ey) in enumerate(pts_guia):
@@ -730,7 +813,7 @@ if len(st.session_state.calibracion_pts) == pts_requeridos:
     y0 = int(round((h_trab - crop_h) * (pan_y / 100.0)))
     overlay_crop = overlay[y0:y0 + crop_h, x0:x0 + crop_w]
 
-    col_v1, col_v2 = st.columns([3, 1])
+    col_v1, col_v2 = st.columns([3, 1.1])
     with col_v2:
         st.metric(f"Puntos activos [{est_activa}]", f"{len(pts_guia)} (mín. 2)")
 
@@ -741,15 +824,14 @@ if len(st.session_state.calibracion_pts) == pts_requeridos:
                     img_trabajo_bgr, mascara_macro, pts_guia, px_per_mm,
                     tipo_estructura=tipo_est, es_microscopio=es_microscopio, suavizar_subpixel=suavizar_eje
                 )
-                st.session_state.trazos_foto_actual[est_activa] = res_trazo
+                est_foto["trazos"][est_activa] = res_trazo
                 if est_activa == "LT" and not es_microscopio:
-                    st.session_state.top3_acm_actual = res_trazo["top3_anchos_mm"]
+                    est_foto["top3"] = res_trazo["top3_anchos_mm"]
 
                 st.session_state.extremos_pts = []
                 st.session_state.ultimo_clic_ext = None
                 st.rerun()
 
-        # Botones de Deshacer y Limpiar siempre disponibles para puntos activos
         b1, b2 = st.columns(2)
         with b1:
             if st.button("↩️ Deshacer", disabled=(len(pts_guia) == 0), use_container_width=True):
@@ -762,145 +844,170 @@ if len(st.session_state.calibracion_pts) == pts_requeridos:
                 st.session_state.ultimo_clic_ext = None
                 st.rerun()
 
-        # Recuperar/Editar o Eliminar una estructura ya fijada
-        if est_activa in st.session_state.trazos_foto_actual:
+        if not es_microscopio and est_foto["borrar_pts"]:
+            if st.button(f"♻️ Restaurar manchas borradas ({len(est_foto['borrar_pts'])})", use_container_width=True):
+                est_foto["borrar_pts"] = []
+                st.rerun()
+
+        if est_activa in est_foto["trazos"]:
             st.divider()
-            st.info(f"[{est_activa}] ya tiene medida fijada.")
+            val_fijado = est_foto["trazos"][est_activa]["valor_mm"]
+            st.success(f"[{est_activa}] = **{val_fijado:.3f} mm** ({val_fijado*1000:.1f} µm)")
             if st.button(f"✏️ Editar puntos de [{est_activa}]", use_container_width=True):
-                trazo_prev = st.session_state.trazos_foto_actual.pop(est_activa)
+                trazo_prev = est_foto["trazos"].pop(est_activa)
                 st.session_state.extremos_pts = list(trazo_prev["puntos_originales"])
                 st.session_state.ultimo_clic_ext = None
                 st.rerun()
             if st.button(f"🗑️ Borrar medida [{est_activa}]", use_container_width=True):
-                st.session_state.trazos_foto_actual.pop(est_activa, None)
+                est_foto["trazos"].pop(est_activa, None)
                 st.rerun()
 
     with col_v1:
         escala_crop = ANCHO_VISOR_PX / float(crop_w)
         h_crop_visor = int(round(crop_h * escala_crop))
         pil_rect = Image.fromarray(overlay_crop).resize((ANCHO_VISOR_PX, h_crop_visor))
-        clic_ext = streamlit_image_coordinates(
+        clic_img = streamlit_image_coordinates(
             pil_rect,
-            key=f"trazo_{etiqueta_foto}_{est_activa}_{len(pts_guia)}_{zoom_factor}_{pan_x}_{pan_y}_{gamma_val}_{gain_val}_{umbral_val}"
+            key=f"trazo_{archivo_activo.name}_{est_activa}_{len(pts_guia)}_{len(est_foto['borrar_pts'])}_{zoom_factor}_{pan_x}_{pan_y}_{gamma_val}_{gain_val}_{umbral_val}"
         )
-        if clic_ext is not None and clic_ext != st.session_state.ultimo_clic_ext:
-            st.session_state.ultimo_clic_ext = clic_ext
-            st.session_state.extremos_pts.append((x0 + clic_ext["x"] / escala_crop, y0 + clic_ext["y"] / escala_crop))
-            st.rerun()
+        if clic_img is not None:
+            coord_real = (x0 + clic_img["x"] / escala_crop, y0 + clic_img["y"] / escala_crop)
+            if "Eliminar forma" in modo_clic:
+                if clic_img != st.session_state.ultimo_clic_borrador:
+                    st.session_state.ultimo_clic_borrador = clic_img
+                    est_foto["borrar_pts"].append(coord_real)
+                    st.rerun()
+            else:
+                if clic_img != st.session_state.ultimo_clic_ext:
+                    st.session_state.ultimo_clic_ext = clic_img
+                    st.session_state.extremos_pts.append(coord_real)
+                    st.rerun()
 
-    # ==========================================================================
-    # PASO 3: CONSOLIDACIÓN POR ESPÉCIMEN E ÍNDICES TAXONÓMICOS
-    # ==========================================================================
-    if st.session_state.trazos_foto_actual:
-        st.divider()
-        st.subheader(f"Paso 3: Resumen e Índices del Espécimen [{id_especimen}]")
+# ==============================================================================
+# PASO 3: CONSOLIDACIÓN MULTIFOTO DEL ESPÉCIMEN + ESTRUCTURAS AUSENTES + ÍNDICES
+# ==============================================================================
+st.divider()
+st.subheader(f"Paso 3: Consolidado Anatómico e Índices del Espécimen [{id_especimen}]")
 
-        # Recuperar medidas previas de este mismo ID de espécimen (ej. LT/ACM de la foto macro)
-        registro_previo = st.session_state.base_especimenes.get(id_especimen, {})
-        medidas_combinadas = {}
-        for cod_m in CATALOGO_ESTRUCTURAS.keys():
-            val_prev = registro_previo.get(f"{cod_m}_mm")
-            if isinstance(val_prev, (int, float)):
-                medidas_combinadas[cod_m] = float(val_prev)
+# Control para marcar estructuras como Ausentes (no presentes en el taxón)
+with st.expander("🚫 Marcar estructuras anatómicas ausentes en este taxón (no se tomarán en cuenta)", expanded=False):
+    ausentes_sel = st.multiselect(
+        "Selecciona las estructuras que NO posee este espécimen:",
+        options=[c for c in CATALOGO_ESTRUCTURAS.keys() if c not in ("LT", "ACM")],
+        default=[c for c in CATALOGO_ESTRUCTURAS.keys() if c not in PERFILES_GENERO[perfil_gen] and c not in ("LT", "ACM")],
+        format_func=lambda c: f"[{c}] {CATALOGO_ESTRUCTURAS[c][0]}"
+    )
+    st.session_state.estructuras_ausentes = set(ausentes_sel)
 
-        # Sobrescribir con las medidas recién trazadas en esta foto
-        for cod_t, trazo_t in st.session_state.trazos_foto_actual.items():
-            medidas_combinadas[cod_t] = round(trazo_t["valor_mm"], 3)
-            if cod_t == "LT" and trazo_t["ancho_auto_mm"] > 0:
-                medidas_combinadas["ACM"] = round(trazo_t["ancho_auto_mm"], 3)
+# Reunir TODAS las medidas fijadas a través de TODAS las fotos abiertas en sesión
+medidas_consolidadas = {}
+fotos_con_datos = []
+top3_cuerpo = []
 
-        cols_m = st.columns(min(6, max(2, len(medidas_combinadas))))
-        for idx_m, (k_med, v_med) in enumerate(medidas_combinadas.items()):
-            cols_m[idx_m % len(cols_m)].metric(f"{k_med}", f"{v_med:.3f} mm", f"{v_med*1000:.0f} µm")
+for f_obj in archivos_subidos:
+    ef = obtener_estado_foto(f_obj.name)
+    if ef["trazos"]:
+        fotos_con_datos.append(f_obj.name)
+        for cod_t, trazo_t in ef["trazos"].items():
+            if cod_t not in st.session_state.estructuras_ausentes:
+                medidas_consolidadas[cod_t] = round(trazo_t["valor_mm"], 3)
+                if cod_t == "LT" and trazo_t["ancho_auto_mm"] > 0:
+                    medidas_consolidadas["ACM"] = round(trazo_t["ancho_auto_mm"], 3)
+        if ef["top3"]:
+            top3_cuerpo = ef["top3"]
 
-        if st.session_state.top3_acm_actual:
-            st.caption(
-                f"📏 **Top-3 zonas más anchas del cuerpo:** "
-                f"{', '.join([f'{w:.3f} mm' for w in st.session_state.top3_acm_actual])} "
-                f"→ Máximo seleccionado: **{max(st.session_state.top3_acm_actual):.3f} mm**"
+if medidas_consolidadas:
+    cols_m = st.columns(min(6, max(2, len(medidas_consolidadas))))
+    for idx_m, (k_med, v_med) in enumerate(medidas_consolidadas.items()):
+        cols_m[idx_m % len(cols_m)].metric(f"{k_med}", f"{v_med:.3f} mm", f"{v_med*1000:.0f} µm")
+
+    if top3_cuerpo:
+        st.caption(
+            f"📏 **Perfil de grosor continuo (Top-3 zonas más anchas):** "
+            f"{', '.join([f'{w:.3f} mm' for w in top3_cuerpo])} → Máximo: **{max(top3_cuerpo):.3f} mm**"
+        )
+
+    modelos_seleccionados = st.multiselect(
+        "📐 Modelos de índices taxonómicos a calcular:",
+        options=[
+            "Modelo Anisákidos / Estructuras Digestivas (LT/ACM, LT/LE, LT/LCI, LT/LAV, LV/LCI, LAV/LCI, LV/E...)",
+            "Índices Clásicos de De Man (a, b, b', c, c', V%)"
+        ],
+        default=[
+            "Modelo Anisákidos / Estructuras Digestivas (LT/ACM, LT/LE, LT/LCI, LT/LAV, LV/LCI, LAV/LCI, LV/E...)",
+            "Índices Clásicos de De Man (a, b, b', c, c', V%)"
+        ]
+    )
+
+    mod_pers, mod_deman = calcular_indices_taxonomicos(medidas_consolidadas)
+    indices_mostrar = {}
+    if any("Anisákidos" in m for m in modelos_seleccionados):
+        indices_mostrar.update(mod_pers)
+    if any("De Man" in m for m in modelos_seleccionados):
+        indices_mostrar.update(mod_deman)
+
+    if indices_mostrar:
+        df_idx = pd.DataFrame([
+            {"Índice": k, "Valor": (f"{v:.2f}" if v is not None else "N/A (Ausente o pendiente)")}
+            for k, v in indices_mostrar.items()
+        ])
+        st.dataframe(df_idx.T, use_container_width=True)
+
+    meta_dict = {
+        "ID_Especimen": id_especimen,
+        "Genero": meta_genero,
+        "Morfotipo": meta_morfotipo,
+        "Hospedador": meta_hospedador,
+        "Estadio": meta_estadio,
+    }
+
+    if st.button(f"✅ Guardar Espécimen Consolidado [{id_especimen}] en la Base de Datos", type="primary"):
+        # Generar ficha visual para la foto activa si tiene trazos
+        if est_foto["trazos"] and calibracion_lista:
+            png_bytes = generar_lamina_validacion(
+                img_trabajo_rgb, est_foto["trazos"], medidas_consolidadas,
+                indices_mostrar, f"{id_especimen}__{archivo_activo.name}", meta_dict, px_per_mm
             )
+            st.session_state.imagenes_validadas[f"{id_especimen}__{archivo_activo.name}"] = png_bytes
+            st.image(png_bytes, use_container_width=True)
 
-        modelos_seleccionados = st.multiselect(
-            "📐 Modelos de índices taxonómicos a presentar:",
-            options=[
-                "Modelo Anisákidos / Estructuras Digestivas (LT/ACM, LT/LE, LT/LCI, LT/LAV, LV/LCI, LAV/LCI, LV/E...)",
-                "Índices Clásicos de De Man (a, b, b', c, c', V%)"
-            ],
-            default=[
-                "Modelo Anisákidos / Estructuras Digestivas (LT/ACM, LT/LE, LT/LCI, LT/LAV, LV/LCI, LAV/LCI, LV/E...)",
-                "Índices Clásicos de De Man (a, b, b', c, c', V%)"
-            ]
-        )
-
-        mod_pers, mod_deman = calcular_indices_taxonomicos(medidas_combinadas)
-        indices_mostrar = {}
-        if any("Anisákidos" in m for m in modelos_seleccionados):
-            indices_mostrar.update(mod_pers)
-        if any("De Man" in m for m in modelos_seleccionados):
-            indices_mostrar.update(mod_deman)
-
-        if indices_mostrar:
-            df_idx = pd.DataFrame([
-                {"Índice": k, "Valor": (f"{v:.2f}" if v is not None else "Falta estructura")}
-                for k, v in indices_mostrar.items()
-            ])
-            st.dataframe(df_idx.T, use_container_width=True)
-
-        meta_dict = {
+        fila_consolidada = {
+            "Fecha_Hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "ID_Especimen": id_especimen,
-            "Genero": meta_genero,
+            "Fotos_Integradas": "; ".join(fotos_con_datos),
+            "Genero_Especie": meta_genero,
             "Morfotipo": meta_morfotipo,
             "Hospedador": meta_hospedador,
-            "Estadio": meta_estadio,
+            "Estadio_Sexo": meta_estadio,
+            "Deiridios": c_deiridios,
+            "Labios": c_labios,
+            "Cuticula": c_cuticula,
+            "Mucron_Caudal": c_mucron,
+            "Diente_Larval": c_diente,
+            "Forma_Cola": c_cola,
+            "Observaciones": c_obs,
         }
 
-        if st.button(f"✅ Guardar / Actualizar Espécimen [{id_especimen}] y Generar Ficha", type="primary"):
-            png_bytes = generar_lamina_validacion(
-                img_trabajo_rgb, st.session_state.trazos_foto_actual, medidas_combinadas,
-                indices_mostrar, etiqueta_foto, meta_dict, px_per_mm
-            )
-            fotos_usadas = registro_previo.get("Fotos_Asociadas", "")
-            lista_fotos = [x.strip() for x in fotos_usadas.split(";") if x.strip()]
-            if archivo_activo.name not in lista_fotos:
-                lista_fotos.append(archivo_activo.name)
-
-            fila_consolidada = {
-                "Ultima_Actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "ID_Especimen": id_especimen,
-                "Fotos_Asociadas": "; ".join(lista_fotos),
-                "Genero_Especie": meta_genero,
-                "Morfotipo": meta_morfotipo,
-                "Hospedador": meta_hospedador,
-                "Estadio_Sexo": meta_estadio,
-            }
-            for cod_m in CATALOGO_ESTRUCTURAS.keys():
-                val_mm = medidas_combinadas.get(cod_m)
+        for cod_m in CATALOGO_ESTRUCTURAS.keys():
+            if cod_m in st.session_state.estructuras_ausentes:
+                fila_consolidada[f"{cod_m}_mm"] = "Ausente"
+                fila_consolidada[f"{cod_m}_um"] = "Ausente"
+            else:
+                val_mm = medidas_consolidadas.get(cod_m)
                 fila_consolidada[f"{cod_m}_mm"] = val_mm if val_mm is not None else ""
                 fila_consolidada[f"{cod_m}_um"] = round(val_mm * 1000.0, 1) if val_mm is not None else ""
 
-            all_p, all_dm = calcular_indices_taxonomicos(medidas_combinadas)
-            for k_i, v_i in {**all_p, **all_dm}.items():
-                fila_consolidada[k_i] = v_i if v_i is not None else ""
+        all_p, all_dm = calcular_indices_taxonomicos(medidas_consolidadas)
+        for k_i, v_i in {**all_p, **all_dm}.items():
+            fila_consolidada[k_i] = v_i if v_i is not None else ""
 
-            st.session_state.base_especimenes[id_especimen] = fila_consolidada
-            st.session_state.imagenes_validadas[etiqueta_foto] = png_bytes
-            st.image(png_bytes, use_container_width=True)
-            st.success(f"Espécimen **{id_especimen}** actualizado con las medidas de **{archivo_activo.name}**.")
+        st.session_state.base_especimenes[id_especimen] = fila_consolidada
+        st.success(f"Espécimen **{id_especimen}** guardado con datos consolidados de {len(fotos_con_datos)} fotografía(s) y metadatos morfológicos.")
+else:
+    st.info("Fija al menos una estructura en cualquiera de las fotografías cargadas para ver el consolidado del espécimen.")
 
-        col_b1, col_b2 = st.columns(2)
-        with col_b1:
-            if st.button("➕ Medir otro parásito en esta misma foto", use_container_width=True):
-                siguiente_parasito_misma_foto()
-                st.rerun()
-        with col_b2:
-            if st.session_state.indice_actual < len(archivos_subidos) - 1:
-                if st.button("➡️ Pasar a la Siguiente Fotografía", use_container_width=True):
-                    st.session_state.indice_actual += 1
-                    reiniciar_todo_foto()
-                    st.rerun()
-
-# Tabla acumulada global por espécimen
+# Tabla acumulada global
 if st.session_state.base_especimenes:
     st.divider()
-    st.subheader("📋 Base de Datos Consolidada por Espécimen (Macro + Microscopio)")
+    st.subheader("📋 Base de Datos Consolidada de Especímenes")
     st.dataframe(pd.DataFrame(list(st.session_state.base_especimenes.values())), use_container_width=True)
